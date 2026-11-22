@@ -16,7 +16,7 @@ const app = express();
 const port = Number(process.env.PORT ?? 5000);
 
 type RentalType = "daily" | "weekly" | "monthly";
-type EquipmentStatus = "pending" | "approved" | "rejected";
+type EquipmentStatus = "pending" | "approved" | "rejected"| "archived";
 
 type Equipment = {
   name: string;
@@ -552,6 +552,159 @@ app.get(
     const listings = await equipment
       .find(
         { ownerId },
+        {
+          projection: {
+            name: 1,
+            category: 1,
+            price: 1,
+            rentalType: 1,
+            quantity: 1,
+            status: 1,
+          },
+        },
+      )
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: listings.map(({ _id, name, category, price, rentalType, quantity, status }) => ({
+        id: _id.toHexString(),
+        name,
+        category,
+        price,
+        rentalType,
+        quantity,
+        status,
+      })),
+    });
+  },
+);
+app.get(
+  "/api/owner/equipment/:id",
+  verifyToken,
+  verifyOwner,
+  async (request, response) => {
+    const { id } = request.params;
+
+    if (typeof id !== "string" || !ObjectId.isValid(id)) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    const listing = await equipment.findOne({
+      _id: new ObjectId(id),
+      ownerId: response.locals.auth.userId,
+    });
+
+    if (!listing) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.set("Cache-Control", "no-store").json({
+      data: {
+        name: listing.name,
+        description: listing.description,
+        price: listing.price,
+        quantity: listing.quantity,
+        status: listing.status,
+      },
+    });
+  },
+);
+
+app.patch(
+  "/api/owner/equipment/:id",
+  verifyToken,
+  verifyOwner,
+  async (request, response) => {
+    const { id } = request.params;
+    const { name, description, price, quantity } = request.body ?? {};
+
+    if (typeof id !== "string" || !ObjectId.isValid(id)) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    if (
+      typeof name !== "string" || !name.trim() ||
+      typeof description !== "string" || !description.trim()
+    ) {
+      response.status(400).json({ message: "Enter a name and description." });
+      return;
+    }
+
+    if (
+      typeof price !== "number" || !Number.isFinite(price) || price <= 0 ||
+      typeof quantity !== "number" || !Number.isSafeInteger(quantity) || quantity < 1
+    ) {
+      response.status(400).json({
+        message: "Enter a positive price and a whole quantity of at least 1.",
+      });
+      return;
+    }
+
+    const result = await equipment.updateOne(
+      { _id: new ObjectId(id), ownerId: response.locals.auth.userId },
+      {
+        $set: {
+          name: name.trim(),
+          description: description.trim(),
+          price,
+          quantity,
+          status: "pending",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.json({ message: "Listing saved and sent for review." });
+  },
+);
+app.delete(
+  "/api/owner/equipment/:id",
+  verifyToken,
+  verifyOwner,
+  async (request, response) => {
+    const { id } = request.params;
+
+    if (typeof id !== "string" || !ObjectId.isValid(id)) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    const result = await equipment.updateOne(
+      {
+        _id: new ObjectId(id),
+        ownerId: response.locals.auth.userId,
+        status: { $ne: "archived" },
+      },
+      {
+        $set: { status: "archived", updatedAt: new Date() },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.json({ message: "Listing removed." });
+  },
+);
+app.get(
+  "/api/admin/equipment/all",
+  verifyToken,
+  verifyAdmin,
+  async (_request, response) => {
+    const listings = await equipment
+      .find(
+        {},
         {
           projection: {
             name: 1,
