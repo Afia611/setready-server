@@ -542,6 +542,43 @@ app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request,
 
   response.json({ id: userId.toHexString(), role });
 });
+app.get(
+  "/api/owner/equipment",
+  verifyToken,
+  verifyOwner,
+  async (_request, response) => {
+    const ownerId: string = response.locals.auth.userId;
+
+    const listings = await equipment
+      .find(
+        { ownerId },
+        {
+          projection: {
+            name: 1,
+            category: 1,
+            price: 1,
+            rentalType: 1,
+            quantity: 1,
+            status: 1,
+          },
+        },
+      )
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: listings.map(({ _id, name, category, price, rentalType, quantity, status }) => ({
+        id: _id.toHexString(),
+        name,
+        category,
+        price,
+        rentalType,
+        quantity,
+        status,
+      })),
+    });
+  },
+);
 app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
 });
