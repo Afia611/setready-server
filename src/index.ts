@@ -10,6 +10,7 @@ import {
   verifyRenter,
   verifyToken,
 } from "./middleware/authenticate.js";
+import { createStripeCheckout, stripeWebhook } from "./stripe-webhook.js";
 
 const app = express();
 const port = Number(process.env.PORT ?? 5000);
@@ -51,8 +52,31 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-// Mount Better Auth before Express parses JSON for the other routes.
+function parseRentalDate(value: unknown): number | null {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+
+  if (
+    !Number.isFinite(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== value
+  ) {
+    return null;
+  }
+
+  return date.getTime();
+}
+
+// Better Auth and Stripe need access to the body before JSON parsing.
 app.all("/api/auth/*splat", toNodeHandler(auth));
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  stripeWebhook,
+);
+
 app.use(express.json());
 
 app.get("/api/health", async (_request, response) => {
@@ -232,6 +256,7 @@ app.get("/api/equipment", async (_request, response) => {
     })),
   });
 });
+
 app.get("/api/equipment/:id", verifyToken, async (request, response) => {
   const { id } = request.params;
 
@@ -253,23 +278,6 @@ app.get("/api/equipment/:id", verifyToken, async (request, response) => {
   const { _id, ...details } = listing;
   response.json({ data: { id: _id.toHexString(), ...details } });
 });
-
-function parseRentalDate(value: unknown): number | null {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return null;
-  }
-
-  const date = new Date(`${value}T00:00:00.000Z`);
-
-  if (
-    !Number.isFinite(date.getTime()) ||
-    date.toISOString().slice(0, 10) !== value
-  ) {
-    return null;
-  }
-
-  return date.getTime();
-}
 
 app.post(
   "/api/bookings/quote",
@@ -355,6 +363,16 @@ app.post(
       },
     });
   },
+);
+app.post(
+  "/api/bookings/checkout",
+  verifyToken,
+  verifyRenter,
+  createStripeCheckout,
+);
+app.post(
+  "/api/bookings/webhook",
+  stripeWebhook
 );
 
 app.listen(port, () => {
