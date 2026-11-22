@@ -374,7 +374,174 @@ app.post(
   "/api/bookings/webhook",
   stripeWebhook
 );
+app.get("/api/bookings/mine", verifyToken, verifyRenter, async (_request, response) => {
+  const customerId: string = response.locals.auth.userId;
 
+  const bookings = await db.collection("bookings")
+    .find(
+      { customerId },
+      {
+        projection: {
+          equipmentId: 1,
+          startDate: 1,
+          endDate: 1,
+          quantity: 1,
+          amountMinor: 1,
+          currency: 1,
+          status: 1,
+        },
+      },
+    )
+    .sort({ createdAt: -1, _id: -1 })
+    .toArray();
+
+  response.set("Cache-Control", "no-store").json({
+    data: bookings.map(({ _id, ...booking }) => ({
+      id: _id.toHexString(),
+      ...booking,
+    })),
+  });
+});
+app.get(
+  "/api/owner/rentals",
+  verifyToken,
+  verifyOwner,
+  async (_request, response) => {
+    const ownerId: string = response.locals.auth.userId;
+
+    const listings = await equipment
+      .find({ ownerId })
+      .project<{ _id: ObjectId; name: string }>({ name: 1 })
+      .toArray();
+
+    const equipmentNames = new Map(
+      listings.map((listing) => [listing._id.toHexString(), listing.name]),
+    );
+
+    const rentals = await db
+      .collection<{
+        equipmentId: string;
+        startDate: string;
+        endDate: string;
+        quantity: number;
+        amountMinor: number;
+        currency: string;
+        status: "awaiting_payment" | "paid" | "expired";
+        createdAt: Date;
+      }>("bookings")
+      .find(
+        { equipmentId: { $in: [...equipmentNames.keys()] } },
+        { projection: { stripeSessionId: 0, customerId: 0 } },
+      )
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: rentals.map((rental) => ({
+        id: rental._id.toHexString(),
+        equipmentName: equipmentNames.get(rental.equipmentId) ?? "Equipment",
+        startDate: rental.startDate,
+        endDate: rental.endDate,
+        quantity: rental.quantity,
+        amountMinor: rental.amountMinor,
+        currency: rental.currency,
+        status: rental.status,
+      })),
+    });
+  },
+);
+app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_request, response) => {
+  const rentals = await db
+    .collection<{
+      equipmentId: string;
+      startDate: string;
+      endDate: string;
+      quantity: number;
+      amountMinor: number;
+      currency: string;
+      status: "awaiting_payment" | "paid" | "expired";
+      createdAt: Date;
+    }>("bookings")
+    .find({})
+    .sort({ createdAt: -1, _id: -1 })
+    .toArray();
+
+  const listingIds = [...new Set(rentals.map((rental) => rental.equipmentId))]
+    .filter((id) => ObjectId.isValid(id))
+    .map((id) => new ObjectId(id));
+
+  const listings = await equipment
+    .find({ _id: { $in: listingIds } })
+    .project<{ _id: ObjectId; name: string }>({ name: 1 })
+    .toArray();
+
+  const names = new Map(
+    listings.map((listing) => [listing._id.toHexString(), listing.name]),
+  );
+
+  response.set("Cache-Control", "no-store").json({
+    data: rentals.map((rental) => ({
+      id: rental._id.toHexString(),
+      equipmentName: names.get(rental.equipmentId) ?? "Unavailable equipment",
+      startDate: rental.startDate,
+      endDate: rental.endDate,
+      quantity: rental.quantity,
+      amountMinor: rental.amountMinor,
+      currency: rental.currency,
+      status: rental.status,
+    })),
+  });
+});
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (_request, response) => {
+  const users = await db.collection("user")
+    .find({}, { projection: { name: 1, email: 1, role: 1 } })
+    .sort({ email: 1 })
+    .toArray();
+
+  response.set("Cache-Control", "no-store").json({
+    data: users.map(({ _id, name, email, role }) => ({
+      id: _id.toHexString(),
+      name,
+      email,
+      role,
+    })),
+  });
+});
+
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request, response) => {
+  const { id } = request.params;
+  const role: unknown = request.body?.role;
+  const objectIdPattern = /^[a-f0-9]{24}$/i;
+
+  if (typeof id !== "string" || !objectIdPattern.test(id)) {
+    response.status(400).json({ message: "Invalid user ID." });
+    return;
+  }
+
+  if (role !== "customer" && role !== "owner" && role !== "admin") {
+    response.status(400).json({ message: "Invalid role." });
+    return;
+  }
+
+  const userId = new ObjectId(id);
+
+  if (userId.toHexString() === response.locals.auth.userId) {
+    response.status(409).json({ message: "You cannot change your own role." });
+    return;
+  }
+
+  const result = await db.collection("user").updateOne(
+    { _id: userId },
+    { $set: { role, updatedAt: new Date() } },
+  );
+
+  if (result.matchedCount === 0) {
+    response.status(404).json({ message: "User not found." });
+    return;
+  }
+
+  response.json({ id: userId.toHexString(), role });
+});
 app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
 });
