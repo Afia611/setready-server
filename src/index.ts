@@ -16,7 +16,8 @@ const app = express();
 const port = Number(process.env.PORT ?? 5000);
 
 type RentalType = "daily" | "weekly" | "monthly";
-type EquipmentStatus = "pending" | "approved" | "rejected"| "archived";
+type EquipmentStatus = "pending" | "approved" | "rejected" | "archived";
+type BookingStatus = "awaiting_payment" | "paid" | "expired";
 
 type Equipment = {
   name: string;
@@ -37,7 +38,41 @@ type Equipment = {
   updatedAt: Date;
 };
 
+type Booking = {
+  customerId: string;
+  equipmentId: string;
+  startDate: string;
+  endDate: string;
+  quantity: number;
+  amountMinor: number;
+  currency: string;
+  status: BookingStatus;
+  createdAt: Date;
+};
+
+type User = {
+  name: string;
+  email: string;
+  role?: "customer" | "owner" | "admin";
+  updatedAt?: Date;
+};
+
 const equipment = db.collection<Equipment>("equipment");
+const bookings = db.collection<Booking>("bookings");
+const users = db.collection<User>("user");
+
+const dayMs = 86_400_000;
+const rentalDays: Record<RentalType, number> = {
+  daily: 1,
+  weekly: 7,
+  monthly: 30,
+};
+
+function parseObjectId(value: unknown): ObjectId | null {
+  return typeof value === "string" && /^[a-f0-9]{24}$/i.test(value)
+    ? new ObjectId(value)
+    : null;
+}
 
 function readText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -58,19 +93,59 @@ function parseRentalDate(value: unknown): number | null {
   }
 
   const date = new Date(`${value}T00:00:00.000Z`);
+  const timestamp = date.getTime();
 
-  if (
-    !Number.isFinite(date.getTime()) ||
-    date.toISOString().slice(0, 10) !== value
-  ) {
+  if (!Number.isFinite(timestamp) || date.toISOString().slice(0, 10) !== value) {
     return null;
   }
 
-  return date.getTime();
+  return timestamp;
 }
 
-// Better Auth and Stripe need access to the body before JSON parsing.
+const dhakaDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Dhaka",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+function todayInDhaka(): number {
+  const parts = dhakaDateFormatter.formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  return Date.parse(`${year}-${month}-${day}T00:00:00.000Z`);
+}
+
+function toEquipmentRow(listing: Equipment & { _id: ObjectId }) {
+  return {
+    id: listing._id.toHexString(),
+    name: listing.name,
+    category: listing.category,
+    price: listing.price,
+    rentalType: listing.rentalType,
+    quantity: listing.quantity,
+    status: listing.status,
+  };
+}
+
+function toRentalRow(booking: Booking & { _id: ObjectId }) {
+  return {
+    id: booking._id.toHexString(),
+    equipmentId: booking.equipmentId,
+    startDate: booking.startDate,
+    endDate: booking.endDate,
+    quantity: booking.quantity,
+    amountMinor: booking.amountMinor,
+    currency: booking.currency,
+    status: booking.status,
+  };
+}
+
+// Better Auth and Stripe must receive the request before JSON parsing.
 app.all("/api/auth/*splat", toNodeHandler(auth));
+
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
@@ -170,7 +245,7 @@ app.post(
     }
 
     const now = new Date();
-    const listing: Equipment = {
+    const result = await equipment.insertOne({
       ...fields,
       price,
       quantity,
@@ -179,13 +254,30 @@ app.post(
       status: "pending",
       createdAt: now,
       updatedAt: now,
-    };
-
-    const result = await equipment.insertOne(listing);
+    });
 
     response.status(201).json({
       id: result.insertedId.toHexString(),
-      status: listing.status,
+      status: "pending",
+    });
+  },
+);
+
+app.get(
+  "/api/owner/equipment",
+  verifyToken,
+  verifyOwner,
+  async (_request, response) => {
+    const listings = await equipment
+      .find({
+        ownerId: response.locals.auth.userId,
+        status: { $ne: "archived" },
+      })
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: listings.map(toEquipmentRow),
     });
   },
 );
@@ -200,11 +292,28 @@ app.get(
       .sort({ createdAt: -1 })
       .toArray();
 
-    response.json({
+    response.set("Cache-Control", "no-store").json({
       data: listings.map(({ _id, ...listing }) => ({
         id: _id.toHexString(),
         ...listing,
       })),
+    });
+  },
+);
+
+// Register this before the Admin /:id route.
+app.get(
+  "/api/admin/equipment/all",
+  verifyToken,
+  verifyAdmin,
+  async (_request, response) => {
+    const listings = await equipment
+      .find({})
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: listings.map(toEquipmentRow),
     });
   },
 );
@@ -214,10 +323,10 @@ app.patch(
   verifyToken,
   verifyAdmin,
   async (request, response) => {
-    const { id } = request.params;
-    const status = request.body?.status;
+    const id = parseObjectId(request.params.id);
+    const status: unknown = request.body?.status;
 
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    if (!id) {
       response.status(400).json({ message: "Invalid equipment ID." });
       return;
     }
@@ -230,7 +339,7 @@ app.patch(
     }
 
     const result = await equipment.updateOne(
-      { _id: new ObjectId(id) },
+      { _id: id, status: { $ne: "archived" } },
       { $set: { status, updatedAt: new Date() } },
     );
 
@@ -239,9 +348,136 @@ app.patch(
       return;
     }
 
-    response.json({ id, status });
+    response.json({ id: id.toHexString(), status });
   },
 );
+
+function registerEquipmentManagement(
+  path: string,
+  verifyRole: typeof verifyOwner,
+  scope: "owner" | "admin",
+) {
+  function activeListing(id: ObjectId, userId: string) {
+    return {
+      _id: id,
+      status: { $ne: "archived" as const },
+      ...(scope === "owner" ? { ownerId: userId } : {}),
+    };
+  }
+
+  app.get(path, verifyToken, verifyRole, async (request, response) => {
+    const id = parseObjectId(request.params.id);
+
+    if (!id) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    const listing = await equipment.findOne(
+      activeListing(id, response.locals.auth.userId),
+    );
+
+    if (!listing) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.set("Cache-Control", "no-store").json({
+      data: {
+        name: listing.name,
+        description: listing.description,
+        price: listing.price,
+        quantity: listing.quantity,
+        status: listing.status,
+      },
+    });
+  });
+
+  app.patch(path, verifyToken, verifyRole, async (request, response) => {
+    const id = parseObjectId(request.params.id);
+    const body = request.body ?? {};
+    const name = readText(body.name);
+    const description = readText(body.description);
+    const { price, quantity } = body;
+
+    if (!id) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    if (!name || !description) {
+      response.status(400).json({ message: "Enter a name and description." });
+      return;
+    }
+
+    if (
+      typeof price !== "number" ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      typeof quantity !== "number" ||
+      !Number.isSafeInteger(quantity) ||
+      quantity < 1
+    ) {
+      response.status(400).json({
+        message: "Enter a positive price and a whole quantity of at least 1.",
+      });
+      return;
+    }
+
+    const changes: Partial<Equipment> = {
+      name,
+      description,
+      price,
+      quantity,
+      updatedAt: new Date(),
+    };
+
+    if (scope === "owner") {
+      changes.status = "pending";
+    }
+
+    const result = await equipment.updateOne(
+      activeListing(id, response.locals.auth.userId),
+      { $set: changes },
+    );
+
+    if (result.matchedCount === 0) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.json({
+      message:
+        scope === "owner"
+          ? "Listing saved and sent for review."
+          : "Listing saved.",
+    });
+  });
+
+  app.delete(path, verifyToken, verifyRole, async (request, response) => {
+    const id = parseObjectId(request.params.id);
+
+    if (!id) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    const result = await equipment.updateOne(
+      activeListing(id, response.locals.auth.userId),
+      { $set: { status: "archived", updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      response.status(404).json({ message: "Listing not found." });
+      return;
+    }
+
+    response.json({ message: "Listing archived." });
+  });
+}
+
+registerEquipmentManagement("/api/owner/equipment/:id", verifyOwner, "owner");
+registerEquipmentManagement("/api/admin/equipment/:id", verifyAdmin, "admin");
 
 app.get("/api/equipment", async (_request, response) => {
   const listings = await equipment
@@ -258,17 +494,14 @@ app.get("/api/equipment", async (_request, response) => {
 });
 
 app.get("/api/equipment/:id", verifyToken, async (request, response) => {
-  const { id } = request.params;
+  const id = parseObjectId(request.params.id);
 
-  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+  if (!id) {
     response.status(400).json({ message: "Invalid equipment ID." });
     return;
   }
 
-  const listing = await equipment.findOne({
-    _id: new ObjectId(id),
-    status: "approved",
-  });
+  const listing = await equipment.findOne({ _id: id, status: "approved" });
 
   if (!listing) {
     response.status(404).json({ message: "Equipment not found." });
@@ -285,27 +518,17 @@ app.post(
   verifyRenter,
   async (request, response) => {
     const { equipmentId, startDate, endDate, quantity } = request.body ?? {};
+    const id = parseObjectId(equipmentId);
 
-    if (typeof equipmentId !== "string" || !ObjectId.isValid(equipmentId)) {
+    if (!id) {
       response.status(400).json({ message: "Invalid equipment ID." });
       return;
     }
 
     const start = parseRentalDate(startDate);
     const end = parseRentalDate(endDate);
-    const todayInDhaka = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Dhaka",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(new Date());
 
-    if (
-      start === null ||
-      end === null ||
-      end < start ||
-      startDate < todayInDhaka
-    ) {
+    if (start === null || end === null || end < start || start < todayInDhaka()) {
       response.status(400).json({
         message: "Choose valid rental dates starting today or later.",
       });
@@ -323,10 +546,7 @@ app.post(
       return;
     }
 
-    const listing = await equipment.findOne({
-      _id: new ObjectId(equipmentId),
-      status: "approved",
-    });
+    const listing = await equipment.findOne({ _id: id, status: "approved" });
 
     if (!listing) {
       response.status(404).json({ message: "Equipment not found." });
@@ -340,13 +560,12 @@ app.post(
       return;
     }
 
-    const days = (end - start) / 86_400_000 + 1;
-    const daysPerPeriod = { daily: 1, weekly: 7, monthly: 30 };
-    const periods = Math.ceil(days / daysPerPeriod[listing.rentalType]);
+    const days = (end - start) / dayMs + 1;
+    const periods = Math.ceil(days / rentalDays[listing.rentalType]);
     const totalMinor = Math.round(listing.price * 100) * periods * quantity;
 
-    if (!Number.isSafeInteger(totalMinor)) {
-      response.status(400).json({ message: "The rental total is too large." });
+    if (!Number.isSafeInteger(totalMinor) || totalMinor < 1) {
+      response.status(400).json({ message: "Invalid rental total." });
       return;
     }
 
@@ -364,374 +583,149 @@ app.post(
     });
   },
 );
+
 app.post(
   "/api/bookings/checkout",
   verifyToken,
   verifyRenter,
   createStripeCheckout,
 );
-app.post(
-  "/api/bookings/webhook",
-  stripeWebhook
+
+app.get(
+  "/api/bookings/mine",
+  verifyToken,
+  verifyRenter,
+  async (_request, response) => {
+    const rentals = await bookings
+      .find({ customerId: response.locals.auth.userId })
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    response.set("Cache-Control", "no-store").json({
+      data: rentals.map(toRentalRow),
+    });
+  },
 );
-app.get("/api/bookings/mine", verifyToken, verifyRenter, async (_request, response) => {
-  const customerId: string = response.locals.auth.userId;
 
-  const bookings = await db.collection("bookings")
-    .find(
-      { customerId },
-      {
-        projection: {
-          equipmentId: 1,
-          startDate: 1,
-          endDate: 1,
-          quantity: 1,
-          amountMinor: 1,
-          currency: 1,
-          status: 1,
-        },
-      },
-    )
-    .sort({ createdAt: -1, _id: -1 })
-    .toArray();
-
-  response.set("Cache-Control", "no-store").json({
-    data: bookings.map(({ _id, ...booking }) => ({
-      id: _id.toHexString(),
-      ...booking,
-    })),
-  });
-});
 app.get(
   "/api/owner/rentals",
   verifyToken,
   verifyOwner,
   async (_request, response) => {
-    const ownerId: string = response.locals.auth.userId;
-
+    // Include archived equipment so its bookings remain in rental history.
     const listings = await equipment
-      .find({ ownerId })
+      .find({ ownerId: response.locals.auth.userId })
       .project<{ _id: ObjectId; name: string }>({ name: 1 })
       .toArray();
 
-    const equipmentNames = new Map(
-      listings.map((listing) => [listing._id.toHexString(), listing.name]),
+    const names = new Map(
+      listings.map(({ _id, name }) => [_id.toHexString(), name]),
     );
 
-    const rentals = await db
-      .collection<{
-        equipmentId: string;
-        startDate: string;
-        endDate: string;
-        quantity: number;
-        amountMinor: number;
-        currency: string;
-        status: "awaiting_payment" | "paid" | "expired";
-        createdAt: Date;
-      }>("bookings")
-      .find(
-        { equipmentId: { $in: [...equipmentNames.keys()] } },
-        { projection: { stripeSessionId: 0, customerId: 0 } },
-      )
+    const rentals = await bookings
+      .find({ equipmentId: { $in: [...names.keys()] } })
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
 
     response.set("Cache-Control", "no-store").json({
-      data: rentals.map((rental) => ({
-        id: rental._id.toHexString(),
-        equipmentName: equipmentNames.get(rental.equipmentId) ?? "Equipment",
-        startDate: rental.startDate,
-        endDate: rental.endDate,
-        quantity: rental.quantity,
-        amountMinor: rental.amountMinor,
-        currency: rental.currency,
-        status: rental.status,
+      data: rentals.map((booking) => ({
+        ...toRentalRow(booking),
+        equipmentName: names.get(booking.equipmentId) ?? "Equipment",
       })),
     });
   },
 );
-app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_request, response) => {
-  const rentals = await db
-    .collection<{
-      equipmentId: string;
-      startDate: string;
-      endDate: string;
-      quantity: number;
-      amountMinor: number;
-      currency: string;
-      status: "awaiting_payment" | "paid" | "expired";
-      createdAt: Date;
-    }>("bookings")
-    .find({})
-    .sort({ createdAt: -1, _id: -1 })
-    .toArray();
 
-  const listingIds = [...new Set(rentals.map((rental) => rental.equipmentId))]
-    .filter((id) => ObjectId.isValid(id))
-    .map((id) => new ObjectId(id));
-
-  const listings = await equipment
-    .find({ _id: { $in: listingIds } })
-    .project<{ _id: ObjectId; name: string }>({ name: 1 })
-    .toArray();
-
-  const names = new Map(
-    listings.map((listing) => [listing._id.toHexString(), listing.name]),
-  );
-
-  response.set("Cache-Control", "no-store").json({
-    data: rentals.map((rental) => ({
-      id: rental._id.toHexString(),
-      equipmentName: names.get(rental.equipmentId) ?? "Unavailable equipment",
-      startDate: rental.startDate,
-      endDate: rental.endDate,
-      quantity: rental.quantity,
-      amountMinor: rental.amountMinor,
-      currency: rental.currency,
-      status: rental.status,
-    })),
-  });
-});
-app.get("/api/admin/users", verifyToken, verifyAdmin, async (_request, response) => {
-  const users = await db.collection("user")
-    .find({}, { projection: { name: 1, email: 1, role: 1 } })
-    .sort({ email: 1 })
-    .toArray();
-
-  response.set("Cache-Control", "no-store").json({
-    data: users.map(({ _id, name, email, role }) => ({
-      id: _id.toHexString(),
-      name,
-      email,
-      role,
-    })),
-  });
-});
-
-app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request, response) => {
-  const { id } = request.params;
-  const role: unknown = request.body?.role;
-  const objectIdPattern = /^[a-f0-9]{24}$/i;
-
-  if (typeof id !== "string" || !objectIdPattern.test(id)) {
-    response.status(400).json({ message: "Invalid user ID." });
-    return;
-  }
-
-  if (role !== "customer" && role !== "owner" && role !== "admin") {
-    response.status(400).json({ message: "Invalid role." });
-    return;
-  }
-
-  const userId = new ObjectId(id);
-
-  if (userId.toHexString() === response.locals.auth.userId) {
-    response.status(409).json({ message: "You cannot change your own role." });
-    return;
-  }
-
-  const result = await db.collection("user").updateOne(
-    { _id: userId },
-    { $set: { role, updatedAt: new Date() } },
-  );
-
-  if (result.matchedCount === 0) {
-    response.status(404).json({ message: "User not found." });
-    return;
-  }
-
-  response.json({ id: userId.toHexString(), role });
-});
 app.get(
-  "/api/owner/equipment",
+  "/api/admin/rentals",
   verifyToken,
-  verifyOwner,
+  verifyAdmin,
   async (_request, response) => {
-    const ownerId: string = response.locals.auth.userId;
+    const rentals = await bookings
+      .find({})
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    const listingIds = [...new Set(rentals.map((booking) => booking.equipmentId))]
+      .map(parseObjectId)
+      .filter((id): id is ObjectId => id !== null);
 
     const listings = await equipment
-      .find(
-        { ownerId },
-        {
-          projection: {
-            name: 1,
-            category: 1,
-            price: 1,
-            rentalType: 1,
-            quantity: 1,
-            status: 1,
-          },
-        },
-      )
-      .sort({ createdAt: -1, _id: -1 })
+      .find({ _id: { $in: listingIds } })
+      .project<{ _id: ObjectId; name: string }>({ name: 1 })
       .toArray();
 
+    const names = new Map(
+      listings.map(({ _id, name }) => [_id.toHexString(), name]),
+    );
+
     response.set("Cache-Control", "no-store").json({
-      data: listings.map(({ _id, name, category, price, rentalType, quantity, status }) => ({
-        id: _id.toHexString(),
-        name,
-        category,
-        price,
-        rentalType,
-        quantity,
-        status,
+      data: rentals.map((booking) => ({
+        ...toRentalRow(booking),
+        equipmentName: names.get(booking.equipmentId) ?? "Unavailable equipment",
       })),
     });
   },
 );
+
 app.get(
-  "/api/owner/equipment/:id",
+  "/api/admin/users",
   verifyToken,
-  verifyOwner,
-  async (request, response) => {
-    const { id } = request.params;
-
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
-      response.status(400).json({ message: "Invalid equipment ID." });
-      return;
-    }
-
-    const listing = await equipment.findOne({
-      _id: new ObjectId(id),
-      ownerId: response.locals.auth.userId,
-    });
-
-    if (!listing) {
-      response.status(404).json({ message: "Listing not found." });
-      return;
-    }
+  verifyAdmin,
+  async (_request, response) => {
+    const accounts = await users
+      .find({}, { projection: { name: 1, email: 1, role: 1 } })
+      .sort({ email: 1 })
+      .toArray();
 
     response.set("Cache-Control", "no-store").json({
-      data: {
-        name: listing.name,
-        description: listing.description,
-        price: listing.price,
-        quantity: listing.quantity,
-        status: listing.status,
-      },
+      data: accounts.map(({ _id, name, email, role }) => ({
+        id: _id.toHexString(),
+        name,
+        email,
+        role,
+      })),
     });
   },
 );
 
 app.patch(
-  "/api/owner/equipment/:id",
-  verifyToken,
-  verifyOwner,
-  async (request, response) => {
-    const { id } = request.params;
-    const { name, description, price, quantity } = request.body ?? {};
-
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
-      response.status(400).json({ message: "Invalid equipment ID." });
-      return;
-    }
-
-    if (
-      typeof name !== "string" || !name.trim() ||
-      typeof description !== "string" || !description.trim()
-    ) {
-      response.status(400).json({ message: "Enter a name and description." });
-      return;
-    }
-
-    if (
-      typeof price !== "number" || !Number.isFinite(price) || price <= 0 ||
-      typeof quantity !== "number" || !Number.isSafeInteger(quantity) || quantity < 1
-    ) {
-      response.status(400).json({
-        message: "Enter a positive price and a whole quantity of at least 1.",
-      });
-      return;
-    }
-
-    const result = await equipment.updateOne(
-      { _id: new ObjectId(id), ownerId: response.locals.auth.userId },
-      {
-        $set: {
-          name: name.trim(),
-          description: description.trim(),
-          price,
-          quantity,
-          status: "pending",
-          updatedAt: new Date(),
-        },
-      },
-    );
-
-    if (result.matchedCount === 0) {
-      response.status(404).json({ message: "Listing not found." });
-      return;
-    }
-
-    response.json({ message: "Listing saved and sent for review." });
-  },
-);
-app.delete(
-  "/api/owner/equipment/:id",
-  verifyToken,
-  verifyOwner,
-  async (request, response) => {
-    const { id } = request.params;
-
-    if (typeof id !== "string" || !ObjectId.isValid(id)) {
-      response.status(400).json({ message: "Invalid equipment ID." });
-      return;
-    }
-
-    const result = await equipment.updateOne(
-      {
-        _id: new ObjectId(id),
-        ownerId: response.locals.auth.userId,
-        status: { $ne: "archived" },
-      },
-      {
-        $set: { status: "archived", updatedAt: new Date() },
-      },
-    );
-
-    if (result.matchedCount === 0) {
-      response.status(404).json({ message: "Listing not found." });
-      return;
-    }
-
-    response.json({ message: "Listing removed." });
-  },
-);
-app.get(
-  "/api/admin/equipment/all",
+  "/api/admin/users/:id/role",
   verifyToken,
   verifyAdmin,
-  async (_request, response) => {
-    const listings = await equipment
-      .find(
-        {},
-        {
-          projection: {
-            name: 1,
-            category: 1,
-            price: 1,
-            rentalType: 1,
-            quantity: 1,
-            status: 1,
-          },
-        },
-      )
-      .sort({ createdAt: -1, _id: -1 })
-      .toArray();
+  async (request, response) => {
+    const id = parseObjectId(request.params.id);
+    const role: unknown = request.body?.role;
 
-    response.set("Cache-Control", "no-store").json({
-      data: listings.map(({ _id, name, category, price, rentalType, quantity, status }) => ({
-        id: _id.toHexString(),
-        name,
-        category,
-        price,
-        rentalType,
-        quantity,
-        status,
-      })),
-    });
+    if (!id) {
+      response.status(400).json({ message: "Invalid user ID." });
+      return;
+    }
+
+    if (role !== "customer" && role !== "owner" && role !== "admin") {
+      response.status(400).json({ message: "Invalid role." });
+      return;
+    }
+
+    if (id.toHexString() === response.locals.auth.userId) {
+      response.status(409).json({ message: "You cannot change your own role." });
+      return;
+    }
+
+    const result = await users.updateOne(
+      { _id: id },
+      { $set: { role, updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      response.status(404).json({ message: "User not found." });
+      return;
+    }
+
+    response.json({ id: id.toHexString(), role });
   },
 );
+
 app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
 });
