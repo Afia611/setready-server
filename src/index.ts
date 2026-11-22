@@ -253,6 +253,110 @@ app.get("/api/equipment/:id", verifyToken, async (request, response) => {
   const { _id, ...details } = listing;
   response.json({ data: { id: _id.toHexString(), ...details } });
 });
+
+function parseRentalDate(value: unknown): number | null {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return null;
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+
+  if (
+    !Number.isFinite(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== value
+  ) {
+    return null;
+  }
+
+  return date.getTime();
+}
+
+app.post(
+  "/api/bookings/quote",
+  verifyToken,
+  verifyRenter,
+  async (request, response) => {
+    const { equipmentId, startDate, endDate, quantity } = request.body ?? {};
+
+    if (typeof equipmentId !== "string" || !ObjectId.isValid(equipmentId)) {
+      response.status(400).json({ message: "Invalid equipment ID." });
+      return;
+    }
+
+    const start = parseRentalDate(startDate);
+    const end = parseRentalDate(endDate);
+    const todayInDhaka = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Dhaka",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+
+    if (
+      start === null ||
+      end === null ||
+      end < start ||
+      startDate < todayInDhaka
+    ) {
+      response.status(400).json({
+        message: "Choose valid rental dates starting today or later.",
+      });
+      return;
+    }
+
+    if (
+      typeof quantity !== "number" ||
+      !Number.isSafeInteger(quantity) ||
+      quantity < 1
+    ) {
+      response.status(400).json({
+        message: "Quantity must be a positive whole number.",
+      });
+      return;
+    }
+
+    const listing = await equipment.findOne({
+      _id: new ObjectId(equipmentId),
+      status: "approved",
+    });
+
+    if (!listing) {
+      response.status(404).json({ message: "Equipment not found." });
+      return;
+    }
+
+    if (quantity > listing.quantity) {
+      response.status(409).json({
+        message: `This listing has a maximum of ${listing.quantity} units.`,
+      });
+      return;
+    }
+
+    const days = (end - start) / 86_400_000 + 1;
+    const daysPerPeriod = { daily: 1, weekly: 7, monthly: 30 };
+    const periods = Math.ceil(days / daysPerPeriod[listing.rentalType]);
+    const totalMinor = Math.round(listing.price * 100) * periods * quantity;
+
+    if (!Number.isSafeInteger(totalMinor)) {
+      response.status(400).json({ message: "The rental total is too large." });
+      return;
+    }
+
+    response.json({
+      data: {
+        equipmentId,
+        startDate,
+        endDate,
+        days,
+        periods,
+        quantity,
+        currency: "BDT",
+        total: totalMinor / 100,
+      },
+    });
+  },
+);
+
 app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
 });
