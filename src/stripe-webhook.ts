@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import type { RequestHandler } from "express";
 import { ObjectId } from "mongodb";
 import Stripe from "stripe";
-import { db } from "./db.js";
+import { availableQuantity } from "./booking-availability.js";
+import { db, mongoClient } from "./db.js";
 
 type RentalQuote = {
   equipmentId: string;
@@ -22,12 +23,23 @@ type Booking = {
   amountMinor: number;
   currency: string;
   status: "awaiting_payment" | "paid" | "expired";
+  contactNumber?: string;
+  deliveryAddress?: string;
+  notes?: string;
+  checkoutExpiresAt?: Date;
   stripeSessionId?: string;
   paidAt?: Date;
+  paymentStatus?: "paid";
   createdAt: Date;
 };
 
 const bookings = db.collection<Booking>("bookings");
+const equipment = db.collection<{ status: string; quantity: number; checkoutVersion?: number }>("equipment");
+const payments = db.collection<{ _id: string }>("payments");
+
+function text(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
 
 export const createStripeCheckout: RequestHandler = async (request, response) => {
   const apiKey = process.env.STRIPE_SECRET_KEY;
@@ -38,8 +50,21 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
     return;
   }
 
-  const { equipmentId, startDate, endDate, quantity, checkoutKey } =
-    request.body ?? {};
+  const body = request.body ?? {};
+  const { startDate, endDate, quantity, checkoutKey } = body;
+  const equipmentId = typeof body.equipmentId === "string" ? body.equipmentId.toLowerCase() : "";
+  const contactNumber = text(body.contactNumber);
+  const deliveryAddress = text(body.deliveryAddress);
+  const notes = text(body.notes);
+
+  if (!/^[+\d][\d ().-]{5,24}$/.test(contactNumber) ||
+      contactNumber.replace(/\D/g, "").length < 6 ||
+      !deliveryAddress || deliveryAddress.length > 500 ||
+      notes.length > 1000 ||
+      (body.notes != null && typeof body.notes !== "string")) {
+    response.status(400).json({ message: "Enter a valid contact number and delivery address. Notes can be up to 1,000 characters." });
+    return;
+  }
 
   if (
     typeof checkoutKey !== "string" ||
@@ -104,18 +129,38 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
         quantity: quote.quantity,
         amountMinor,
         currency: quote.currency.toLowerCase(),
+        contactNumber,
+        deliveryAddress,
+        notes,
+        checkoutExpiresAt: new Date(Date.now() + 45 * 60_000),
         status: "awaiting_payment",
         createdAt: new Date(),
       };
 
-      booking = await bookings.findOneAndUpdate(
-        { _id: bookingId },
-        { $setOnInsert: newBooking },
-        { upsert: true, returnDocument: "after" },
-      );
+      booking = await mongoClient.withSession((session) => session.withTransaction(async () => {
+        const existing = await bookings.findOne({ _id: bookingId }, { session });
+        if (existing) return existing;
+
+        // Updating the listing serializes concurrent reservations for this equipment.
+        const listing = await equipment.findOneAndUpdate(
+          { _id: new ObjectId(quote.equipmentId), status: "approved" },
+          { $inc: { checkoutVersion: 1 } },
+          { session },
+        );
+        if (!listing) return null;
+
+        const available = await availableQuantity(
+          quote.equipmentId, quote.startDate, quote.endDate, listing.quantity, session,
+        );
+        if (available < quote.quantity) return null;
+
+        await bookings.insertOne({ _id: bookingId, ...newBooking }, { session });
+        return { _id: bookingId, ...newBooking };
+      }));
 
       if (!booking) {
-        throw new Error("Could not save booking.");
+        response.status(409).json({ message: "This quantity is no longer available for those dates." });
+        return;
       }
     }
 
@@ -124,7 +169,10 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
       booking.equipmentId !== equipmentId ||
       booking.startDate !== startDate ||
       booking.endDate !== endDate ||
-      booking.quantity !== quantity
+      booking.quantity !== quantity ||
+      booking.contactNumber !== contactNumber ||
+      booking.deliveryAddress !== deliveryAddress ||
+      booking.notes !== notes
     ) {
       response.status(409).json({
         message: "Your rental selection changed. Refresh and try again.",
@@ -142,8 +190,9 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
       return;
     }
 
-    // Keep retries within Stripe's idempotency-key window.
-    if (!booking.stripeSessionId && Date.now() - booking.createdAt.getTime() >= 86_400_000) {
+    // Stripe requires a new Checkout Session to expire at least 30 minutes later.
+    const expiresAt = booking.checkoutExpiresAt?.getTime() ?? 0;
+    if (!booking.stripeSessionId && expiresAt - Date.now() < 30 * 60_000 + 1000) {
       response.status(409).json({
         message: "This checkout expired. Refresh to start a new checkout.",
       });
@@ -151,26 +200,27 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
     }
 
     const checkout = booking.stripeSessionId
-  ? await stripe.checkout.sessions.retrieve(booking.stripeSessionId)
-  : await stripe.checkout.sessions.create(
-      {
-        mode: "payment",
-        client_reference_id: bookingId.toHexString(),
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: booking.currency,
-              unit_amount: booking.amountMinor,
-              product_data: { name: "SetReady equipment rental" },
+        ? await stripe.checkout.sessions.retrieve(booking.stripeSessionId)
+        : await stripe.checkout.sessions.create(
+            {
+              mode: "payment",
+              expires_at: Math.floor(expiresAt / 1000),
+              client_reference_id: bookingId.toHexString(),
+              line_items: [
+                {
+                  quantity: 1,
+                  price_data: {
+                    currency: booking.currency,
+                    unit_amount: booking.amountMinor,
+                    product_data: { name: "SetReady equipment rental" },
+                  },
+                },
+              ],
+              success_url: `${clientUrl}/booking/success`,
+              cancel_url: `${clientUrl}/equipment/${encodeURIComponent(booking.equipmentId)}`,
             },
-          },
-        ],
-        success_url: `${clientUrl}/booking/success`,
-        cancel_url: `${clientUrl}/equipment/${encodeURIComponent(booking.equipmentId)}`,
-      },
-      { idempotencyKey: `setready-checkout-${bookingId.toHexString()}` },
-    );
+            { idempotencyKey: `setready-checkout-${bookingId.toHexString()}` },
+          );
     if (checkout.status !== "open" || !checkout.url) {
       response.status(409).json({
         message:
@@ -224,6 +274,8 @@ export const stripeWebhook: RequestHandler = async (request, response) => {
 
   if (
     event.type !== "checkout.session.completed" &&
+    event.type !== "checkout.session.async_payment_succeeded" &&
+    event.type !== "checkout.session.async_payment_failed" &&
     event.type !== "checkout.session.expired"
   ) {
     response.json({ received: true });
@@ -232,7 +284,10 @@ export const stripeWebhook: RequestHandler = async (request, response) => {
 
   try {
     const sessionId = event.data.object.id;
-    const booking = await bookings.findOne({ stripeSessionId: sessionId });
+    const reference = event.data.object.client_reference_id;
+    const booking = reference && /^[a-f0-9]{24}$/i.test(reference)
+      ? await bookings.findOne({ _id: new ObjectId(reference) })
+      : null;
 
     if (!booking) {
       // CLI test fixtures have no corresponding booking in SetReady.
@@ -243,6 +298,7 @@ export const stripeWebhook: RequestHandler = async (request, response) => {
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
     if (
+      (booking.stripeSessionId && booking.stripeSessionId !== session.id) ||
       session.client_reference_id !== booking._id.toHexString() ||
       session.amount_total !== booking.amountMinor ||
       session.currency !== booking.currency
@@ -252,11 +308,33 @@ export const stripeWebhook: RequestHandler = async (request, response) => {
     }
 
     if (session.payment_status === "paid") {
-      await bookings.updateOne(
-        { _id: booking._id, status: { $ne: "paid" } },
-        { $set: { status: "paid", paidAt: new Date() } },
-      );
-    } else if (session.status === "expired") {
+      const paidAt = booking.paidAt ?? new Date();
+      const paymentIntentId = typeof session.payment_intent === "string"
+        ? session.payment_intent
+        : session.payment_intent?.id;
+
+      await mongoClient.withSession((transaction) => transaction.withTransaction(async () => {
+        await payments.updateOne(
+          { _id: session.id },
+          { $setOnInsert: {
+            bookingId: booking._id.toHexString(),
+            customerId: booking.customerId,
+            stripeSessionId: session.id,
+            stripePaymentIntentId: paymentIntentId,
+            amountMinor: booking.amountMinor,
+            currency: booking.currency,
+            status: "paid",
+            paidAt,
+          } },
+          { session: transaction, upsert: true },
+        );
+        await bookings.updateOne(
+          { _id: booking._id, status: { $ne: "paid" } },
+          { $set: { status: "paid", paymentStatus: "paid", paidAt, stripeSessionId: session.id } },
+          { session: transaction },
+        );
+      }));
+    } else if (session.status === "expired" || event.type === "checkout.session.async_payment_failed") {
       await bookings.updateOne(
         { _id: booking._id, status: "awaiting_payment" },
         { $set: { status: "expired" } },

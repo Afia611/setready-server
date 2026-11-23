@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { toNodeHandler } from "better-auth/node";
 import { ObjectId } from "mongodb";
+import { availableQuantity } from "./booking-availability.js";
 import { auth } from "./auth.js";
 import { db } from "./db.js";
 import {
@@ -58,6 +59,7 @@ type User = {
 };
 
 const equipment = db.collection<Equipment>("equipment");
+const favorites = db.collection<{ _id: string; customerId: string; equipmentId: ObjectId }>("favorites");
 const bookings = db.collection<Booking>("bookings");
 const users = db.collection<User>("user");
 
@@ -638,6 +640,43 @@ app.get("/api/equipment", async (_request, response) => {
   });
 });
 
+app.get("/api/favorites", verifyToken, verifyRenter, async (_request, response) => {
+  const saved = await favorites.find({ customerId: response.locals.auth.userId }).toArray();
+  const items = await equipment.find({
+    _id: { $in: saved.map((favorite) => favorite.equipmentId) },
+  }).toArray();
+  response.set("Cache-Control", "no-store").json({
+    data: items.map(({ _id, name, category, status }) => ({
+      id: _id.toHexString(), name, category, available: status === "approved",
+    })),
+  });
+});
+
+app.put("/api/favorites/:id", verifyToken, verifyRenter, async (request, response) => {
+  const id = parseObjectId(request.params.id);
+  if (!id || !await equipment.findOne({ _id: id, status: "approved" })) {
+    response.status(404).json({ message: "Equipment not found." });
+    return;
+  }
+  const customerId: string = response.locals.auth.userId;
+  await favorites.updateOne(
+    { _id: `${customerId}:${id.toHexString()}` },
+    { $setOnInsert: { customerId, equipmentId: id } },
+    { upsert: true },
+  );
+  response.sendStatus(204);
+});
+
+app.delete("/api/favorites/:id", verifyToken, verifyRenter, async (request, response) => {
+  const id = parseObjectId(request.params.id);
+  if (!id) {
+    response.status(400).json({ message: "Invalid equipment ID." });
+    return;
+  }
+  await favorites.deleteOne({ _id: `${response.locals.auth.userId}:${id.toHexString()}` });
+  response.sendStatus(204);
+});
+
 app.get("/api/equipment/:id", verifyToken, async (request, response) => {
   const id = parseObjectId(request.params.id);
 
@@ -653,8 +692,19 @@ app.get("/api/equipment/:id", verifyToken, async (request, response) => {
     return;
   }
 
-  const { _id, ...details } = listing;
-  response.json({ data: { id: _id.toHexString(), ...details } });
+  const { _id, ownerId, ...details } = listing;
+  const ownerObjectId = parseObjectId(ownerId);
+  const owner = ownerObjectId
+    ? await users.findOne({ _id: ownerObjectId }, { projection: { name: 1 } })
+    : null;
+  const isCustomer = response.locals.auth.role === "customer";
+  const isFavorite = isCustomer && Boolean(await favorites.findOne({
+    _id: `${response.locals.auth.userId}:${_id.toHexString()}`,
+  }));
+
+  response.set("Cache-Control", "no-store").json({
+    data: { id: _id.toHexString(), ...details, ownerName: owner?.name, isCustomer, isFavorite },
+  });
 });
 
 app.post(
@@ -698,9 +748,10 @@ app.post(
       return;
     }
 
-    if (quantity > listing.quantity) {
+    const available = await availableQuantity(id.toHexString(), startDate, endDate, listing.quantity);
+    if (quantity > available) {
       response.status(409).json({
-        message: `This listing has a maximum of ${listing.quantity} units.`,
+        message: `Only ${available} units are available for those dates.`,
       });
       return;
     }
@@ -716,7 +767,7 @@ app.post(
 
     response.json({
       data: {
-        equipmentId,
+        equipmentId: id.toHexString(),
         startDate,
         endDate,
         days,
