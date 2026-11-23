@@ -17,6 +17,7 @@ type RentalQuote = {
 type Booking = {
   customerId: string;
   equipmentId: string;
+  equipmentName?: string;
   startDate: string;
   endDate: string;
   quantity: number;
@@ -34,7 +35,7 @@ type Booking = {
 };
 
 const bookings = db.collection<Booking>("bookings");
-const equipment = db.collection<{ status: string; quantity: number; checkoutVersion?: number }>("equipment");
+const equipment = db.collection<{ status: string; quantity: number; name: string; checkoutVersion?: number }>("equipment");
 const payments = db.collection<{ _id: string }>("payments");
 
 function text(value: unknown) {
@@ -154,8 +155,9 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
         );
         if (available < quote.quantity) return null;
 
-        await bookings.insertOne({ _id: bookingId, ...newBooking }, { session });
-        return { _id: bookingId, ...newBooking };
+        const reservation = { _id: bookingId, ...newBooking, equipmentName: listing.name };
+        await bookings.insertOne(reservation, { session });
+        return reservation;
       }));
 
       if (!booking) {

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { toNodeHandler } from "better-auth/node";
-import { ObjectId } from "mongodb";
+import { ObjectId, type Filter, type Sort } from "mongodb";
 import { availableQuantity } from "./booking-availability.js";
 import { auth } from "./auth.js";
 import { db } from "./db.js";
@@ -48,6 +48,8 @@ type Booking = {
   amountMinor: number;
   currency: string;
   status: BookingStatus;
+  paymentStatus?: "paid";
+  equipmentName?: string;
   createdAt: Date;
 };
 
@@ -626,17 +628,56 @@ function registerEquipmentManagement(
 registerEquipmentManagement("/api/owner/equipment/:id", verifyOwner, "owner");
 registerEquipmentManagement("/api/admin/equipment/:id", verifyAdmin, "admin");
 
-app.get("/api/equipment", async (_request, response) => {
-  const listings = await equipment
-    .find({ status: "approved" })
-    .sort({ createdAt: -1 })
-    .toArray();
+app.get("/api/equipment", async (request, response) => {
+  const search = readText(request.query.search).slice(0, 120);
+  const category = readText(request.query.category);
+  const rentalType = readText(request.query.rentalType);
+  const availability = readText(request.query.availability);
+  const minimum = readText(request.query.minPrice);
+  const maximum = readText(request.query.maxPrice);
+  const minPrice = minimum === "" ? undefined : Number(minimum);
+  const maxPrice = maximum === "" ? undefined : Number(maximum);
+
+  if ((minPrice !== undefined && (!Number.isFinite(minPrice) || minPrice < 0)) ||
+      (maxPrice !== undefined && (!Number.isFinite(maxPrice) || maxPrice < 0)) ||
+      (minPrice !== undefined && maxPrice !== undefined && minPrice > maxPrice)) {
+    response.status(400).json({ message: "Enter a valid price range." });
+    return;
+  }
+
+  const match: Filter<Equipment> = { status: "approved" };
+  if (search) {
+    const literal = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const term = { $regex: literal, $options: "i" };
+    match.$or = [{ name: term }, { location: term }, { brand: term }];
+  }
+  if (category) match.category = category;
+  if (rentalType === "daily" || rentalType === "weekly" || rentalType === "monthly") {
+    match.rentalType = rentalType;
+  }
+  if (availability === "available") match.quantity = { $gt: 0 };
+  if (availability === "out-of-stock") match.quantity = { $lte: 0 };
+  if (minPrice !== undefined || maxPrice !== undefined) {
+    match.price = {
+      ...(minPrice !== undefined ? { $gte: minPrice } : {}),
+      ...(maxPrice !== undefined ? { $lte: maxPrice } : {}),
+    };
+  }
+
+  const sort: Sort = request.query.sort === "price-asc"
+    ? { price: 1, _id: -1 }
+    : request.query.sort === "price-desc"
+      ? { price: -1, _id: -1 }
+      : { createdAt: -1, _id: -1 };
+
+  const [listings, categories] = await Promise.all([
+    equipment.find(match).sort(sort).toArray(),
+    equipment.distinct("category", { status: "approved" }),
+  ]);
 
   response.json({
-    data: listings.map(({ _id, ...listing }) => ({
-      id: _id.toHexString(),
-      ...listing,
-    })),
+    data: listings.map(({ _id, ...listing }) => ({ id: _id.toHexString(), ...listing })),
+    categories: categories.filter(Boolean).sort((a, b) => a.localeCompare(b, "en")),
   });
 });
 
@@ -797,8 +838,20 @@ app.get(
       .sort({ createdAt: -1, _id: -1 })
       .toArray();
 
+    const ids = [...new Set(rentals.map((rental) => rental.equipmentId))]
+      .map(parseObjectId)
+      .filter((id): id is ObjectId => id !== null);
+    const listings = await equipment.find({ _id: { $in: ids } })
+      .project<{ _id: ObjectId; name: string }>({ name: 1 }).toArray();
+    const names = new Map(listings.map(({ _id, name }) => [_id.toHexString(), name]));
+
     response.set("Cache-Control", "no-store").json({
-      data: rentals.map(toRentalRow),
+      data: rentals.map((rental) => ({
+        ...toRentalRow(rental),
+        equipmentName: rental.equipmentName ?? names.get(rental.equipmentId) ?? "Unavailable equipment",
+        createdAt: rental.createdAt,
+        paymentStatus: rental.paymentStatus ?? (rental.status === "paid" ? "paid" : "unpaid"),
+      })),
     });
   },
 );

@@ -12,6 +12,30 @@ const clientOrigins = (
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+function validateProfile(body: Record<string, unknown> = {}) {
+  const { name, image, contactEmail, phone, address } = body;
+  const fields = { name, image, contactEmail, phone, address };
+  const limits = { name: 100, image: 2048, contactEmail: 254, phone: 30, address: 500 };
+
+  for (const key of Object.keys(limits) as (keyof typeof limits)[]) {
+    const value = fields[key];
+    if (value !== undefined && !(key === "image" && value === null) &&
+        (typeof value !== "string" || value.length > limits[key])) {
+      throw new APIError("BAD_REQUEST", { message: `Invalid profile field: ${key}.` });
+    }
+  }
+
+  if (typeof name === "string" && !name.trim()) {
+    throw new APIError("BAD_REQUEST", { message: "Enter your name." });
+  }
+  if (typeof contactEmail === "string" && contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+    throw new APIError("BAD_REQUEST", { message: "Enter a valid contact email." });
+  }
+  if (typeof image === "string" && image && !/^https?:\/\//i.test(image)) {
+    throw new APIError("BAD_REQUEST", { message: "Enter a valid photo URL beginning with http:// or https://." });
+  }
+}
+
 function validateSignUp(body: unknown) {
   if (!body || typeof body !== "object") {
     return;
@@ -61,10 +85,16 @@ export const auth = betterAuth({
       if (context.path === "/sign-up/email") {
         validateSignUp(context.body);
       }
+      if (context.path === "/update-user") {
+        validateProfile(context.body);
+      }
     }),
   },
   user: {
     additionalFields: {
+      contactEmail: { type: "string", required: false },
+      phone: { type: "string", required: false },
+      address: { type: "string", required: false },
       role: {
         type: "string",
         required: false,
