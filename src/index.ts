@@ -186,6 +186,151 @@ app.get("/api/admin/me", verifyToken, verifyAdmin, (_request, response) => {
   response.json(response.locals.auth);
 });
 
+function analyticsDateInDhaka(): string {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Dhaka",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, response) => {
+  try {
+    const [totalUsers, totalEquipment, pendingApprovals, bookingStats] =
+      await Promise.all([
+        users.countDocuments(),
+        equipment.countDocuments(),
+        equipment.countDocuments({ status: "pending" }),
+        bookings.aggregate([
+          {
+            $facet: {
+              totalBookings: [{ $count: "count" }],
+              completedRentals: [
+                { $match: { status: "paid", endDate: { $lt: analyticsDateInDhaka() } } },
+                { $count: "count" },
+              ],
+              revenue: [
+                { $match: { status: "paid" } },
+                { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
+                { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
+                { $sort: { currency: 1 } },
+              ],
+              monthlyBookings: [
+                {
+                  $group: {
+                    _id: {
+                      $dateToString: {
+                        format: "%Y-%m",
+                        date: "$createdAt",
+                        timezone: "Asia/Dhaka",
+                      },
+                    },
+                    count: { $sum: 1 },
+                  },
+                },
+                { $project: { _id: 0, month: "$_id", count: 1 } },
+                { $sort: { month: 1 } },
+              ],
+            },
+          },
+        ]).next(),
+      ]);
+
+    response.json({
+      success: true,
+      data: {
+        totalUsers,
+        totalEquipment,
+        pendingApprovals,
+        totalBookings: bookingStats?.totalBookings[0]?.count ?? 0,
+        completedRentals: bookingStats?.completedRentals[0]?.count ?? 0,
+        totalRevenue: bookingStats?.revenue ?? [],
+        monthlyBookings: bookingStats?.monthlyBookings ?? [],
+      },
+    });
+  } catch (error) {
+    console.error("Could not load admin analytics", error);
+    response.status(500).json({ success: false, message: "Could not load admin analytics." });
+  }
+});
+
+app.get("/api/owner/analytics", verifyToken, verifyOwner, async (_request, response) => {
+  try {
+    const ownerId: string = response.locals.auth.userId;
+    const [totalListedEquipment, rentalStats] = await Promise.all([
+      equipment.countDocuments({ ownerId, status: { $ne: "archived" } }),
+      equipment.aggregate([
+        { $match: { ownerId } },
+        { $project: { equipmentId: { $toString: "$_id" } } },
+        {
+          $lookup: {
+            from: "bookings",
+            localField: "equipmentId",
+            foreignField: "equipmentId",
+            as: "rental",
+          },
+        },
+        { $unwind: "$rental" },
+        { $replaceRoot: { newRoot: "$rental" } },
+        { $match: { status: "paid" } },
+        {
+          $facet: {
+            completedRentals: [
+              { $match: { endDate: { $lt: analyticsDateInDhaka() } } },
+              { $count: "count" },
+            ],
+            earnings: [
+              { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
+              { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
+              { $sort: { currency: 1 } },
+            ],
+            monthlyEarnings: [
+              { $match: { paidAt: { $type: "date" } } },
+              {
+                $group: {
+                  _id: {
+                    month: {
+                      $dateToString: {
+                        format: "%Y-%m",
+                        date: "$paidAt",
+                        timezone: "Asia/Dhaka",
+                      },
+                    },
+                    currency: "$currency",
+                  },
+                  amountMinor: { $sum: "$amountMinor" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  month: "$_id.month",
+                  currency: "$_id.currency",
+                  amountMinor: 1,
+                },
+              },
+              { $sort: { month: 1, currency: 1 } },
+            ],
+          },
+        },
+      ]).next(),
+    ]);
+
+    response.json({
+      success: true,
+      data: {
+        totalListedEquipment,
+        completedRentals: rentalStats?.completedRentals[0]?.count ?? 0,
+        totalEarnings: rentalStats?.earnings ?? [],
+        monthlyEarnings: rentalStats?.monthlyEarnings ?? [],
+      },
+    });
+  } catch (error) {
+    console.error("Could not load owner analytics", error);
+    response.status(500).json({ success: false, message: "Could not load owner analytics." });
+  }
+});
 app.post(
   "/api/owner/equipment",
   verifyToken,
