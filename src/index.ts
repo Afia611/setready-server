@@ -66,6 +66,7 @@ type User = {
 const equipment = db.collection<Equipment>("equipment");
 const favorites = db.collection<{ _id: string; customerId: string; equipmentId: ObjectId }>("favorites");
 const bookings = db.collection<Booking>("bookings");
+const payments = db.collection("payments");
 const users = db.collection<User>("user");
 
 const dayMs = 86_400_000;
@@ -204,7 +205,7 @@ app.get("/api/admin/me", verifyToken, verifyAdmin, (_request, response) => {
 
 app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, response) => {
   try {
-    const [totalUsers, totalEquipment, pendingApprovals, bookingStats] =
+    const [totalUsers, totalEquipment, pendingApprovals, bookingStats, totalRevenue] =
       await Promise.all([
         users.countDocuments(),
         equipment.countDocuments(),
@@ -216,12 +217,6 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, respo
               completedRentals: [
                 { $match: { status: "completed" } },
                 { $count: "count" },
-              ],
-              revenue: [
-                { $match: { status: { $in: ["paid", "completed"] } } },
-                { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
-                { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
-                { $sort: { currency: 1 } },
               ],
               monthlyBookings: [
                 {
@@ -242,6 +237,12 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, respo
             },
           },
         ]).next(),
+        payments.aggregate([
+          { $match: { status: "paid" } },
+          { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
+          { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
+          { $sort: { currency: 1 } },
+        ]).toArray(),
       ]);
 
     response.json({
@@ -252,7 +253,7 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, respo
         pendingApprovals,
         totalBookings: bookingStats?.totalBookings[0]?.count ?? 0,
         completedRentals: bookingStats?.completedRentals[0]?.count ?? 0,
-        totalRevenue: bookingStats?.revenue ?? [],
+        totalRevenue,
         monthlyBookings: bookingStats?.monthlyBookings ?? [],
       },
     });
@@ -280,7 +281,16 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (_request, respo
         },
         { $unwind: "$rental" },
         { $replaceRoot: { newRoot: "$rental" } },
-        { $match: { status: { $in: ["paid", "completed"] } } },
+        { $set: { bookingId: { $toString: "$_id" } } },
+        {
+          $lookup: {
+            from: payments.collectionName,
+            localField: "bookingId",
+            foreignField: "bookingId",
+            pipeline: [{ $match: { status: "paid" } }],
+            as: "payments",
+          },
+        },
         {
           $facet: {
             completedRentals: [
@@ -288,25 +298,27 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (_request, respo
               { $count: "count" },
             ],
             earnings: [
-              { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
+              { $unwind: "$payments" },
+              { $group: { _id: "$payments.currency", amountMinor: { $sum: "$payments.amountMinor" } } },
               { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
               { $sort: { currency: 1 } },
             ],
             monthlyEarnings: [
-              { $match: { paidAt: { $type: "date" } } },
+              { $unwind: "$payments" },
+              { $match: { "payments.paidAt": { $type: "date" } } },
               {
                 $group: {
                   _id: {
                     month: {
                       $dateToString: {
                         format: "%Y-%m",
-                        date: "$paidAt",
+                        date: "$payments.paidAt",
                         timezone: "Asia/Dhaka",
                       },
                     },
-                    currency: "$currency",
+                    currency: "$payments.currency",
                   },
-                  amountMinor: { $sum: "$amountMinor" },
+                  amountMinor: { $sum: "$payments.amountMinor" },
                 },
               },
               {
@@ -660,7 +672,12 @@ app.get("/api/equipment", async (request, response) => {
   if (search) {
     const literal = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const term = { $regex: literal, $options: "i" };
-    match.$or = [{ name: term }, { location: term }, { brand: term }];
+    match.$or = [
+      { name: term },
+      { category: term },
+      { location: term },
+      { brand: term },
+    ];
   }
   if (category) match.category = category;
   if (rentalType === "daily" || rentalType === "weekly" || rentalType === "monthly") {
@@ -1030,3 +1047,6 @@ app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
   startBookingCompletionJob();
 });
+
+
+
