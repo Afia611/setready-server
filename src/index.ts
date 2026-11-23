@@ -1,3 +1,7 @@
+
+
+
+
 import "dotenv/config";
 import express from "express";
 import { uploadEquipmentImage } from "./equipment-image.js";
@@ -94,3 +98,7 @@ function isHttpUrl(value: string): boolean {
     return false;
   }
 }
+
+
+
+
