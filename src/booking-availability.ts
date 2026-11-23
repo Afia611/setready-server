@@ -11,7 +11,7 @@ export async function availableQuantity(
   const rentals = await db.collection("bookings").find({
     equipmentId,
     $or: [
-      { status: "paid" },
+      { status: { $in: ["paid", "completed"] } },
       { status: "awaiting_payment", stripeSessionId: { $exists: true } },
       { status: "awaiting_payment", checkoutExpiresAt: { $gt: new Date() } },
     ],

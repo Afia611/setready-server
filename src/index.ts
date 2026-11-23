@@ -3,6 +3,8 @@ import express from "express";
 import { toNodeHandler } from "better-auth/node";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { availableQuantity } from "./booking-availability.js";
+import { startBookingCompletionJob, type BookingStatus } from "./booking-completion.js";
+import { listPage } from "./pagination.js";
 import { auth } from "./auth.js";
 import { db } from "./db.js";
 import {
@@ -18,7 +20,6 @@ const port = Number(process.env.PORT ?? 5000);
 
 type RentalType = "daily" | "weekly" | "monthly";
 type EquipmentStatus = "pending" | "approved" | "rejected" | "archived";
-type BookingStatus = "awaiting_payment" | "paid" | "expired";
 
 type Equipment = {
   name: string;
@@ -190,15 +191,6 @@ app.get("/api/admin/me", verifyToken, verifyAdmin, (_request, response) => {
   response.json(response.locals.auth);
 });
 
-function analyticsDateInDhaka(): string {
-  return new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Asia/Dhaka",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
-}
-
 app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, response) => {
   try {
     const [totalUsers, totalEquipment, pendingApprovals, bookingStats] =
@@ -211,11 +203,11 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_request, respo
             $facet: {
               totalBookings: [{ $count: "count" }],
               completedRentals: [
-                { $match: { status: "paid", endDate: { $lt: analyticsDateInDhaka() } } },
+                { $match: { status: "completed" } },
                 { $count: "count" },
               ],
               revenue: [
-                { $match: { status: "paid" } },
+                { $match: { status: { $in: ["paid", "completed"] } } },
                 { $group: { _id: "$currency", amountMinor: { $sum: "$amountMinor" } } },
                 { $project: { _id: 0, currency: "$_id", amountMinor: 1 } },
                 { $sort: { currency: 1 } },
@@ -277,11 +269,11 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (_request, respo
         },
         { $unwind: "$rental" },
         { $replaceRoot: { newRoot: "$rental" } },
-        { $match: { status: "paid" } },
+        { $match: { status: { $in: ["paid", "completed"] } } },
         {
           $facet: {
             completedRentals: [
-              { $match: { endDate: { $lt: analyticsDateInDhaka() } } },
+              { $match: { status: "completed" } },
               { $count: "count" },
             ],
             earnings: [
@@ -670,13 +662,14 @@ app.get("/api/equipment", async (request, response) => {
       ? { price: -1, _id: -1 }
       : { createdAt: -1, _id: -1 };
 
-  const [listings, categories] = await Promise.all([
-    equipment.find(match).sort(sort).toArray(),
+  const [{ rows: listings, pagination }, categories] = await Promise.all([
+    listPage(equipment, match, sort, request.query.page, 9),
     equipment.distinct("category", { status: "approved" }),
   ]);
 
   response.json({
     data: listings.map(({ _id, ...listing }) => ({ id: _id.toHexString(), ...listing })),
+    pagination,
     categories: categories.filter(Boolean).sort((a, b) => a.localeCompare(b, "en")),
   });
 });
@@ -832,11 +825,11 @@ app.get(
   "/api/bookings/mine",
   verifyToken,
   verifyRenter,
-  async (_request, response) => {
-    const rentals = await bookings
-      .find({ customerId: response.locals.auth.userId })
-      .sort({ createdAt: -1, _id: -1 })
-      .toArray();
+  async (request, response) => {
+    const { rows: rentals, pagination } = await listPage(
+      bookings, { customerId: response.locals.auth.userId },
+      { createdAt: -1, _id: -1 }, request.query.page, 10,
+    );
 
     const ids = [...new Set(rentals.map((rental) => rental.equipmentId))]
       .map(parseObjectId)
@@ -846,11 +839,12 @@ app.get(
     const names = new Map(listings.map(({ _id, name }) => [_id.toHexString(), name]));
 
     response.set("Cache-Control", "no-store").json({
+      pagination,
       data: rentals.map((rental) => ({
         ...toRentalRow(rental),
         equipmentName: rental.equipmentName ?? names.get(rental.equipmentId) ?? "Unavailable equipment",
         createdAt: rental.createdAt,
-        paymentStatus: rental.paymentStatus ?? (rental.status === "paid" ? "paid" : "unpaid"),
+        paymentStatus: rental.paymentStatus ?? (rental.status === "paid" || rental.status === "completed" ? "paid" : "unpaid"),
       })),
     });
   },
@@ -860,7 +854,7 @@ app.get(
   "/api/owner/rentals",
   verifyToken,
   verifyOwner,
-  async (_request, response) => {
+  async (request, response) => {
     // Include archived equipment so its bookings remain in rental history.
     const listings = await equipment
       .find({ ownerId: response.locals.auth.userId })
@@ -871,12 +865,13 @@ app.get(
       listings.map(({ _id, name }) => [_id.toHexString(), name]),
     );
 
-    const rentals = await bookings
-      .find({ equipmentId: { $in: [...names.keys()] } })
-      .sort({ createdAt: -1, _id: -1 })
-      .toArray();
+    const { rows: rentals, pagination } = await listPage(
+      bookings, { equipmentId: { $in: [...names.keys()] } },
+      { createdAt: -1, _id: -1 }, request.query.page, 10,
+    );
 
     response.set("Cache-Control", "no-store").json({
+      pagination,
       data: rentals.map((booking) => ({
         ...toRentalRow(booking),
         equipmentName: names.get(booking.equipmentId) ?? "Equipment",
@@ -889,11 +884,10 @@ app.get(
   "/api/admin/rentals",
   verifyToken,
   verifyAdmin,
-  async (_request, response) => {
-    const rentals = await bookings
-      .find({})
-      .sort({ createdAt: -1, _id: -1 })
-      .toArray();
+  async (request, response) => {
+    const { rows: rentals, pagination } = await listPage(
+      bookings, {}, { createdAt: -1, _id: -1 }, request.query.page, 10,
+    );
 
     const listingIds = [...new Set(rentals.map((booking) => booking.equipmentId))]
       .map(parseObjectId)
@@ -909,6 +903,7 @@ app.get(
     );
 
     response.set("Cache-Control", "no-store").json({
+      pagination,
       data: rentals.map((booking) => ({
         ...toRentalRow(booking),
         equipmentName: names.get(booking.equipmentId) ?? "Unavailable equipment",
@@ -977,4 +972,5 @@ app.patch(
 
 app.listen(port, () => {
   console.log(`SetReady API listening on port ${port}`);
+  startBookingCompletionJob();
 });

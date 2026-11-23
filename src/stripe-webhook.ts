@@ -1,3 +1,4 @@
+import type { BookingStatus } from "./booking-completion.js";
 import { createHash } from "node:crypto";
 import type { RequestHandler } from "express";
 import { ObjectId } from "mongodb";
@@ -23,7 +24,7 @@ type Booking = {
   quantity: number;
   amountMinor: number;
   currency: string;
-  status: "awaiting_payment" | "paid" | "expired";
+  status: BookingStatus;
   contactNumber?: string;
   deliveryAddress?: string;
   notes?: string;
@@ -185,7 +186,7 @@ export const createStripeCheckout: RequestHandler = async (request, response) =>
     if (booking.status !== "awaiting_payment") {
       response.status(409).json({
         message:
-          booking.status === "paid"
+          booking.status === "paid" || booking.status === "completed"
             ? "This booking has already been paid."
             : "This checkout expired. Refresh to start a new checkout.",
       });
@@ -331,7 +332,7 @@ export const stripeWebhook: RequestHandler = async (request, response) => {
           { session: transaction, upsert: true },
         );
         await bookings.updateOne(
-          { _id: booking._id, status: { $ne: "paid" } },
+          { _id: booking._id, status: { $in: ["awaiting_payment", "expired"] } },
           { $set: { status: "paid", paymentStatus: "paid", paidAt, stripeSessionId: session.id } },
           { session: transaction },
         );
