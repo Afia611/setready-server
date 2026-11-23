@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import { uploadEquipmentImage } from "./equipment-image.js";
 import { toNodeHandler } from "better-auth/node";
 import { ObjectId, type Filter, type Sort } from "mongodb";
 import { availableQuantity } from "./booking-availability.js";
@@ -58,6 +59,7 @@ type User = {
   name: string;
   email: string;
   role?: "customer" | "owner" | "admin";
+  createdAt?: Date;
   updatedAt?: Date;
 };
 
@@ -145,6 +147,7 @@ function toRentalRow(booking: Booking & { _id: ObjectId }) {
     amountMinor: booking.amountMinor,
     currency: booking.currency,
     status: booking.status,
+    paymentStatus: booking.paymentStatus ?? (booking.status === "paid" || booking.status === "completed" ? "paid" : "unpaid"),
   };
 }
 
@@ -155,6 +158,14 @@ app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
   stripeWebhook,
+);
+
+app.post(
+  "/api/owner/equipment/image",
+  verifyToken,
+  verifyOwner,
+  express.raw({ type: ["image/jpeg", "image/png", "image/webp"], limit: "3mb" }),
+  uploadEquipmentImage,
 );
 
 app.use(express.json());
@@ -530,6 +541,14 @@ function registerEquipmentManagement(
         price: listing.price,
         quantity: listing.quantity,
         status: listing.status,
+        category: listing.category,
+        location: listing.location,
+        rentalType: listing.rentalType,
+        condition: listing.condition,
+        brand: listing.brand,
+        model: listing.model,
+        imageUrl: listing.imageUrl,
+        rentalTerms: listing.rentalTerms,
       },
     });
   });
@@ -850,6 +869,13 @@ app.get(
   },
 );
 
+async function namesForUsers(ids: (string | undefined)[]) {
+  const objectIds = [...new Set(ids)].map(parseObjectId).filter((id): id is ObjectId => id !== null);
+  const accounts = await users.find({ _id: { $in: objectIds } })
+    .project<{ _id: ObjectId; name: string; email: string }>({ name: 1, email: 1 }).toArray();
+  return new Map(accounts.map(({ _id, name, email }) => [_id.toHexString(), { name, email }]));
+}
+
 app.get(
   "/api/owner/rentals",
   verifyToken,
@@ -870,11 +896,14 @@ app.get(
       { createdAt: -1, _id: -1 }, request.query.page, 10,
     );
 
+    const customers = await namesForUsers(rentals.map(({ customerId }) => customerId));
+
     response.set("Cache-Control", "no-store").json({
       pagination,
       data: rentals.map((booking) => ({
         ...toRentalRow(booking),
-        equipmentName: names.get(booking.equipmentId) ?? "Equipment",
+        equipmentName: booking.equipmentName ?? names.get(booking.equipmentId) ?? "Equipment",
+        customer: customers.get(booking.customerId) ?? null,
       })),
     });
   },
@@ -895,22 +924,48 @@ app.get(
 
     const listings = await equipment
       .find({ _id: { $in: listingIds } })
-      .project<{ _id: ObjectId; name: string }>({ name: 1 })
+      .project<{ _id: ObjectId; name: string; ownerId: string }>({ name: 1, ownerId: 1 })
       .toArray();
 
-    const names = new Map(
-      listings.map(({ _id, name }) => [_id.toHexString(), name]),
-    );
+    const listingsById = new Map(listings.map((listing) => [listing._id.toHexString(), listing]));
+    const accounts = await namesForUsers([
+      ...rentals.map(({ customerId }) => customerId),
+      ...listings.map(({ ownerId }) => ownerId),
+    ]);
 
     response.set("Cache-Control", "no-store").json({
       pagination,
       data: rentals.map((booking) => ({
         ...toRentalRow(booking),
-        equipmentName: names.get(booking.equipmentId) ?? "Unavailable equipment",
+        equipmentName: booking.equipmentName ?? listingsById.get(booking.equipmentId)?.name ?? "Unavailable equipment",
+        customer: accounts.get(booking.customerId) ?? null,
+        owner: accounts.get(listingsById.get(booking.equipmentId)?.ownerId ?? "") ?? null,
+        canComplete: booking.status === "paid" && (parseRentalDate(booking.endDate) ?? Infinity) < todayInDhaka(),
       })),
     });
   },
 );
+
+app.patch("/api/admin/rentals/:id/complete", verifyToken, verifyAdmin, async (request, response) => {
+  const id = parseObjectId(request.params.id);
+  if (!id) {
+    response.status(400).json({ message: "Invalid rental ID." });
+    return;
+  }
+
+  const now = new Date();
+  const cutoff = new Date(todayInDhaka()).toISOString().slice(0, 10);
+  const result = await bookings.updateOne(
+    { _id: id, status: "paid", endDate: { $lt: cutoff } },
+    { $set: { status: "completed", completedAt: now, nextEmailAttemptAt: now } },
+  );
+  if (result.modifiedCount || await bookings.findOne({ _id: id, status: "completed" })) {
+    response.sendStatus(204);
+    return;
+  }
+
+  response.status(409).json({ message: "Only paid rentals whose end date has passed can be completed." });
+});
 
 app.get(
   "/api/admin/users",
@@ -918,16 +973,17 @@ app.get(
   verifyAdmin,
   async (_request, response) => {
     const accounts = await users
-      .find({}, { projection: { name: 1, email: 1, role: 1 } })
+      .find({}, { projection: { name: 1, email: 1, role: 1, createdAt: 1 } })
       .sort({ email: 1 })
       .toArray();
 
     response.set("Cache-Control", "no-store").json({
-      data: accounts.map(({ _id, name, email, role }) => ({
+      data: accounts.map(({ _id, name, email, role, createdAt }) => ({
         id: _id.toHexString(),
         name,
         email,
         role,
+        createdAt: createdAt ?? null,
       })),
     });
   },
